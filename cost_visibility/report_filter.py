@@ -5,6 +5,7 @@ including Report Builder and prepared-report attachment downloads, are untouched
 """
 
 import datetime
+import inspect
 import json
 from decimal import Decimal
 
@@ -62,6 +63,16 @@ def filter_result(data, policy, report_name, ref_doctype):
         clean = {key: _scalar(value) for key, value in col.items() if key in _COLUMN_KEYS}
         if sensitive(clean.get("options")):
             clean.pop("options", None)
+        # Custom reports need this metadata to restore previously added columns.
+        for key in ("id", "insert_after_index"):
+            value = col.get(key)
+            if isinstance(value, (str, int)) and not sensitive(value):
+                clean[key] = value
+        link_field = col.get("link_field")
+        if isinstance(link_field, dict):
+            link_field = link_field.get("fieldname")
+        if isinstance(link_field, str) and link_field and not sensitive(link_field):
+            clean["link_field"] = {"fieldname": link_field}
         kept.append((index, clean))
 
     keys = {value for _, col in kept for value in (col.get("fieldname"), col.get("label"))
@@ -87,9 +98,17 @@ def filter_result(data, policy, report_name, ref_doctype):
         "report_summary": None,
     }
     for key in ("skip_total_row", "add_total_row", "prepared_report", "execution_time",
-                "snapshot_report", "snapshot_at"):
+                 "snapshot_report", "snapshot_at"):
         if key in data:
             result[key] = _scalar(data[key])
+    if isinstance(data.get("custom_filters"), dict):
+        result["custom_filters"] = {
+            key: value if not isinstance(value, list) else list(value)
+            for key, value in data["custom_filters"].items()
+            if isinstance(key, str) and not sensitive(key)
+            and (value is None or isinstance(value, _SCALARS)
+                 or (isinstance(value, list) and all(item is None or isinstance(item, _SCALARS) for item in value)))
+        }
     if not kept:
         result["add_total_row"] = 0
 
@@ -115,9 +134,11 @@ def run(
     are_default_filters: bool = True,
     js_filters: str | list | None = None,
 ) -> dict:
-    data = query_report.run(
-        report_name, filters, user, ignore_prepared_report, custom_columns,
-        is_tree, parent_field, are_default_filters, js_filters,
+    data = frappe.call(
+        query_report.run, report_name=report_name, filters=filters, user=user,
+        ignore_prepared_report=ignore_prepared_report, custom_columns=custom_columns,
+        is_tree=is_tree, parent_field=parent_field, are_default_filters=are_default_filters,
+        js_filters=js_filters,
     )
     policy = get_policy()
     if not policy.get("restricted"):
@@ -205,17 +226,31 @@ def _export_query(form_params, csv_params, populate_response=True):
             data.result = query_report.add_total_row(data.result, data.columns)
 
     query_report.format_fields(data, file_format)
-    table, widths, styles = query_report.build_xlsx_data(
-        data, include_indentation=form_params.include_indentation, include_filters=False,
-        include_hidden_columns=form_params.include_hidden_columns, build_styles=file_format == "Excel",
+    build = query_report.build_xlsx_data
+    legacy_builder = "build_styles" not in inspect.signature(build).parameters
+    if legacy_builder and not cint(form_params.include_hidden_columns):
+        # Older builders do not remove hidden columns from positional rows.
+        keep = [i for i, column in enumerate(data.columns) if not column.get("hidden")]
+        data.result = [
+            [row[i] if i < len(row) else None for i in keep] if isinstance(row, (list, tuple)) else row
+            for row in data.result
+        ]
+        data.columns = [data.columns[i] for i in keep]
+    built = frappe.call(
+        build, data, visible_idx=[], include_indentation=form_params.include_indentation,
+        include_filters=False, include_hidden_columns=form_params.include_hidden_columns,
+        build_styles=file_format == "Excel",
     )
+    table, widths = built[:2]
+    styles = built[2] if len(built) > 2 else None
     if file_format == "CSV":
         extension = "csv"
         content = get_csv_bytes([[handle_html(v) if isinstance(v, str) else v for v in row]
                                  for row in table], csv_params)
     elif file_format == "Excel":
         extension = "xlsx"
-        content = make_xlsx(table, report_name, column_widths=widths, styles=styles).getvalue()
+        sheet_name = "Query Report" if legacy_builder else report_name
+        content = frappe.call(make_xlsx, table, sheet_name, column_widths=widths, styles=styles).getvalue()
     else:
         frappe.throw(title=_("Unsupported file format: {0}").format(file_format),
                      msg=_("Only CSV and Excel formats are supported for export"))

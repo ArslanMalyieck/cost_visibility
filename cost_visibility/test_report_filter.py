@@ -92,11 +92,33 @@ class FilterTests(unittest.TestCase):
                            "custom_filters": {"secret": 1234}}
         result = rf.filter_result(data, RESTRICTED, "Report", "Item")
         self.assertEqual(result["doc"], {"filters": "{}", "report_end_time": "2026-01-01"})
-        self.assertNotIn("custom_filters", result)
+        self.assertEqual(result["custom_filters"], {"secret": 1234})
         self.assertNotIn("valuation_rate", result["result"][0])
         empty = rf.filter_result({"prepared_report": True, "doc": None}, RESTRICTED, "Report", "Item")
         self.assertEqual(empty["result"], [])
         self.assertIsNone(empty["doc"])
+
+    def test_custom_report_columns_and_safe_filters_survive(self):
+        data = {
+            "columns": [
+                {"fieldname": "item", "label": "Item"},
+                {"fieldname": "description-item", "id": "description-item", "label": "Description",
+                 "doctype": "Item", "link_field": {"fieldname": "item", "names": ["private"]},
+                 "insert_after_index": 0},
+                {"fieldname": "valuation_rate", "label": "Valuation Rate"},
+            ],
+            "result": [{"item": "A", "description-item": "Safe", "valuation_rate": 99,
+                        "removed_field": "not returned"}],
+            "custom_filters": {"company": "Example", "warehouses": ["A", "B"],
+                               "valuation_rate": 99, "nested": {"secret": 99}},
+        }
+        result = rf.filter_result(data, RESTRICTED, "Saved Custom Report", "Item")
+        self.assertEqual([col["fieldname"] for col in result["columns"]], ["item", "description-item"])
+        self.assertEqual(result["columns"][1]["link_field"], {"fieldname": "item"})
+        self.assertEqual(result["columns"][1]["id"], "description-item")
+        self.assertEqual(result["columns"][1]["insert_after_index"], 0)
+        self.assertEqual(result["result"], [{"item": "A", "description-item": "Safe"}])
+        self.assertEqual(result["custom_filters"], {"company": "Example", "warehouses": ["A", "B"]})
 
     def test_label_only_data_and_blocked_label_collision(self):
         data = {"columns": [{"fieldname": "item", "label": "Item"},
@@ -134,8 +156,43 @@ class EndpointTests(unittest.TestCase):
                 patch.object(rf.query_report, "get_report_doc", return_value=SimpleNamespace(ref_doctype="Item")), \
                 patch.object(rf, "get_policy", return_value=RESTRICTED):
             result = rf.run("Report", {"x": 1}, "spoofed", True, ["custom"], True, "parent", False, ["js"])
-        core.assert_called_once_with("Report", {"x": 1}, "spoofed", True, ["custom"], True, "parent", False, ["js"])
+        core.assert_called_once_with(report_name="Report", filters={"x": 1}, user="spoofed",
+                                     ignore_prepared_report=True, custom_columns=["custom"], is_tree=True,
+                                     parent_field="parent", are_default_filters=False, js_filters=["js"])
         self.assertNotIn("valuation_rate", result["result"][0])
+
+    def test_run_with_legacy_eight_argument_api_and_custom_reference(self):
+        calls = []
+
+        def legacy_run(report_name, filters=None, user=None, ignore_prepared_report=False,
+                       custom_columns=None, is_tree=False, parent_field=None, are_default_filters=True):
+            calls.append((report_name, filters, user, ignore_prepared_report, custom_columns,
+                          is_tree, parent_field, are_default_filters))
+            return sample()
+
+        columns = [{"fieldname": "custom", "link_field": {"fieldname": "item"}}]
+        with patch.object(rf.query_report, "run", legacy_run), \
+                patch.object(rf.query_report, "get_report_doc", return_value=SimpleNamespace(ref_doctype="Item")) as lookup, \
+                patch.object(rf, "get_policy", return_value=RESTRICTED):
+            result = rf.run("Saved Custom", {"company": "Example"}, "user", True, columns,
+                            True, "parent", False, ["newer-only"])
+        self.assertEqual(calls, [("Saved Custom", {"company": "Example"}, "user", True,
+                                  columns, True, "parent", False)])
+        lookup.assert_called_once_with("Saved Custom")
+        self.assertNotIn("valuation_rate", result["result"][0])
+
+    def test_run_does_not_retry_report_type_errors(self):
+        calls = []
+
+        def legacy_run(report_name, filters=None, user=None, ignore_prepared_report=False,
+                       custom_columns=None, is_tree=False, parent_field=None, are_default_filters=True):
+            calls.append(report_name)
+            raise TypeError("report script failure")
+
+        with patch.object(rf.query_report, "run", legacy_run):
+            with self.assertRaisesRegex(TypeError, "report script failure"):
+                rf.run("Report", js_filters=["newer-only"])
+        self.assertEqual(calls, ["Report"])
 
     def test_run_permission_exception_is_not_caught(self):
         with patch.object(rf.query_report, "run", side_effect=frappe.PermissionError), \
@@ -321,6 +378,48 @@ class EndpointTests(unittest.TestCase):
                 self.assertNotIn("1234", text)
                 self.assertNotIn("3579", text)
                 self.assertNotIn("SECRET FILTER", text)
+
+    def test_legacy_export_builder_uses_two_values_and_filters_hidden_positional_cells(self):
+        from frappe.utils.xlsxutils import make_xlsx as current_make_xlsx
+
+        captured = []
+
+        def legacy_build(data, visible_idx, include_indentation, include_filters=False,
+                         ignore_visible_idx=False, include_hidden_columns=False):
+            captured.append((data.columns, data.result, visible_idx))
+            return ([col["label"] for col in data.columns], *data.result), [10] * len(data.columns)
+
+        def legacy_make_xlsx(data, sheet_name, wb=None, column_widths=None):
+            return current_make_xlsx(data, sheet_name, column_widths=column_widths)
+
+        data = {"columns": [{"fieldname": "item", "label": "Item"},
+                            {"fieldname": "valuation_rate", "label": "Valuation Rate"},
+                            {"fieldname": "hidden_col", "label": "Hidden", "hidden": 1},
+                            {"fieldname": "qty", "label": "Qty"}],
+                "result": [["A", 1234, "HIDDEN", 3]]}
+        for file_format in ("CSV", "Excel"):
+            with self.subTest(file_format=file_format), \
+                    patch.object(rf, "get_policy", return_value=RESTRICTED), \
+                    patch.object(rf.query_report, "run", return_value=deepcopy(data)), \
+                    patch.object(rf.query_report, "get_report_doc", return_value=SimpleNamespace(ref_doctype="Item")), \
+                    patch.object(rf.query_report, "build_xlsx_data", legacy_build), \
+                    patch("frappe.utils.xlsxutils.make_xlsx", legacy_make_xlsx), \
+                    patch.object(rf.frappe, "get_system_settings", side_effect=lambda key: {
+                        "date_format": "yyyy-mm-dd", "time_format": "HH:mm:ss"
+                    }.get(key)):
+                _, ext, content = rf._export_query(params(file_format_type=file_format, include_hidden_columns=False),
+                                                   {"delimiter": ",", "quoting": 0, "decimal_sep": "."}, False)
+            if ext == "csv":
+                text = content.decode()
+            else:
+                workbook = load_workbook(io.BytesIO(content))
+                self.assertEqual(workbook.active.title, "Query Report")
+                text = str(list(workbook.active.values))
+            self.assertIn("Item", text)
+            self.assertIn("Qty", text)
+            self.assertNotIn("1234", text)
+            self.assertNotIn("HIDDEN", text)
+        self.assertEqual(captured[0][1], [["A", 3]])
 
 
 if __name__ == "__main__":

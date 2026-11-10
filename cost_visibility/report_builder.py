@@ -65,11 +65,9 @@ def _reference_sensitive(reference, doctype, report_name, patterns, alias=None):
 
 def _expression_sensitive(value, doctype, report_name, patterns):
     """Classify Frappe query-builder expressions recursively; None means unknown."""
-    from frappe.database.query import FUNCTION_MAPPING, OPERATOR_MAPPING
-
     if isinstance(value, str):
         value = value.strip()
-        if value == "*" or (len(value) >= 2 and value[0] in "'\"" and value[-1] == value[0]):
+        if value == "*" or re.fullmatch(r"'(?:[^'\\]|'')*'", value):
             return False
         return _reference_sensitive(value, doctype, report_name, patterns)
     if value is None or isinstance(value, (int, float)):
@@ -78,8 +76,14 @@ def _expression_sensitive(value, doctype, report_name, patterns):
         parts = [_expression_sensitive(v, doctype, report_name, patterns) for v in value]
         return True if True in parts else None if None in parts else False
     if isinstance(value, dict):
+        from frappe.database import query
+
+        functions = getattr(query, "FUNCTION_MAPPING", {})
+        operators = getattr(query, "OPERATOR_MAPPING", {})
+        if any(not isinstance(k, str) for k in value):
+            return None
         operands = [(k, v) for k, v in value.items() if k.lower() != "as"]
-        if len(operands) != 1 or operands[0][0] not in FUNCTION_MAPPING | OPERATOR_MAPPING:
+        if len(operands) != 1 or (operands[0][0] not in functions and operands[0][0] not in operators):
             return None
         return _expression_sensitive(operands[0][1], doctype, report_name, patterns)
     return None
@@ -110,6 +114,9 @@ def _filter_compressed(data, args, fields, policy):
                 sensitive = _reference_sensitive(parts[0], doctype, report_name, patterns,
                                                    alias=key if len(parts) == 2 else None)
         elif isinstance(field, dict):
+            if any(not isinstance(k, str) for k in field):
+                unresolved = True
+                continue
             aliases = [v for k, v in field.items() if k.lower() == "as"]
             if len(aliases) == 1 and isinstance(aliases[0], str) and _ALIAS.fullmatch(aliases[0]):
                 key = aliases[0]
@@ -154,7 +161,11 @@ def get():
     fields = deepcopy(args.fields)
     if reportview.is_virtual_doctype(args.doctype):
         controller = reportview.get_controller(args.doctype)
-        data = reportview.compress(frappe.call(controller.get_list, args=args, **args))
+        if int(frappe.__version__.split(".", 1)[0]) < 16:
+            rows = controller.get_list(args)
+        else:
+            rows = frappe.call(controller.get_list, args=args, **args)
+        data = reportview.compress(rows)
     else:
         data = reportview.compress(reportview.execute(**args), args=args)
     return _filter_compressed(data, args, fields, policy)
@@ -203,6 +214,8 @@ def _sensitive(field, info, doctype, report_name, patterns):
     expressions = []
     info_owner = doctype
     if isinstance(field, dict):
+        if _expression_sensitive(field, doctype, report_name, patterns) is not False:
+            return True
         if check(field.get("as")):
             return True
         expressions.extend(v for k, v in field.items() if k.lower() != "as" and isinstance(v, str))
@@ -210,7 +223,18 @@ def _sensitive(field, info, doctype, report_name, patterns):
         parts = re.split(r"\s+as\s+", field, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) == 2 and check(parts[1].strip(" `\"'")):
             return True
+        expression = parts[0].strip()
+        if len(parts) == 2 and not _ALIAS.fullmatch(parts[1].strip(" `\"'")):
+            return True
+        aggregate = re.fullmatch(r"(?:count|sum|avg)\s*\(\s*(.*?)\s*\)", expression, re.IGNORECASE)
+        operand = aggregate.group(1) if aggregate else expression
+        if operand == "*" and (not aggregate or not expression.lower().startswith("count")):
+            return True
+        if _expression_sensitive(operand, doctype, report_name, patterns) is not False:
+            return True
         expressions.append(parts[0])
+    else:
+        return True
 
     for expression in expressions:
         for reference in reportview.extract_fieldnames(expression):
@@ -241,7 +265,7 @@ def _export_query(form_params, csv_params, populate_response=True):
 
     from frappe.core.doctype.access_log.access_log import make_access_log
     from frappe.desk.utils import get_csv_bytes, provide_binary_file
-    from frappe.utils.xlsxutils import get_default_xlsx_styles, handle_html, make_xlsx
+    from frappe.utils import xlsxutils
 
     # Keep this in sync with reportview._export_query through the permission and
     # formatting steps; the query and user-settings inputs are never filtered.
@@ -296,15 +320,18 @@ def _export_query(form_params, csv_params, populate_response=True):
 
     if file_format_type == "CSV":
         file_extension = "csv"
-        content = get_csv_bytes([[handle_html(v) if isinstance(v, str) else v for v in row]
+        content = get_csv_bytes([[xlsxutils.handle_html(v) if isinstance(v, str) else v for v in row]
                                  for row in data], csv_params)
     elif file_format_type == "Excel":
         file_extension = "xlsx"
-        styles = get_default_xlsx_styles(
-            columns=[{"fieldname": "sr", "label": sr_label, "fieldtype": "Int"}, *fields_info],
-            data=data[1:], has_total_row=bool(add_totals_row),
-        )
-        content = make_xlsx(data, doctype, styles=styles).getvalue()
+        if hasattr(xlsxutils, "get_default_xlsx_styles"):
+            styles = xlsxutils.get_default_xlsx_styles(
+                columns=[{"fieldname": "sr", "label": sr_label, "fieldtype": "Int"}, *fields_info],
+                data=data[1:], has_total_row=bool(add_totals_row),
+            )
+            content = xlsxutils.make_xlsx(data, doctype, styles=styles).getvalue()
+        else:
+            content = xlsxutils.make_xlsx(data, doctype).getvalue()
 
     if not populate_response:
         return title, file_extension, content

@@ -157,6 +157,35 @@ class PrintTests(unittest.TestCase):
         rows = [frappe._dict(name="A", count=2, average=500, average_qty=3, **{"SUM(rate)": 1000})]
         self.assertEqual(self.run_get(fields, rows)["values"], [["A", 2, None, 3, None]])
 
+    def test_missing_expression_mappings_fail_closed_without_breaking_simple_fields(self):
+        from frappe.database import query
+
+        fields = ["item", "rate", {"COUNT": "*", "as": "count"},
+                  {"MYSTERY": ["rate"], "as": "unknown"}]
+        rows = [frappe._dict(item="A", rate=1234, count=2, unknown=1234)]
+        with patch.dict(query.__dict__):
+            query.__dict__.pop("FUNCTION_MAPPING", None)
+            query.__dict__.pop("OPERATOR_MAPPING", None)
+            self.assertEqual(self.run_get(fields, rows)["values"], [["A", None, None, None]])
+
+    def test_v15_string_aggregate_is_masked_without_mappings(self):
+        from frappe.database import query
+
+        fields = ["item", "sum(`tabPurchase Invoice`.`rate`) AS _aggregate_column"]
+        rows = [frappe._dict(item="A", _aggregate_column=1234)]
+        with patch.dict(query.__dict__):
+            query.__dict__.pop("FUNCTION_MAPPING", None)
+            query.__dict__.pop("OPERATOR_MAPPING", None)
+            self.assertEqual(self.run_get(fields, rows)["values"], [["A", None]])
+
+    def test_unknown_and_malformed_expressions_fail_closed(self):
+        fields = [{"MYSTERY": ["qty"], "as": "unknown"},
+                  {"SUM": {"MYSTERY": ["qty"]}, "as": "nested"},
+                  {"SUM": "'x' || rate || 'y'", "as": "injected"},
+                  {"SUM": "qty", 1: "rate", "as": "malformed"}, "item"]
+        rows = [frappe._dict(unknown=2, nested=2, injected=1234, malformed=1234, item="A")]
+        self.assertEqual(self.run_get(fields, rows)["values"], [[None, None, None, None, "A"]])
+
     def test_standard_columns_and_selling_child_context(self):
         fields = ["name", "`tabSales Invoice Item`.`rate`", "item", "owner"]
         rows = [frappe._dict(name="A", rate=100, item="B", owner="alice", modified="today")]
@@ -197,7 +226,8 @@ class PrintTests(unittest.TestCase):
         args = frappe._dict(doctype="Purchase Invoice", fields=["item", "rate"], add_total_row=1)
         rows = [frappe._dict(item="A", rate=1234)]
         controller = SimpleNamespace(get_list=object())
-        with patch.object(rb.reportview, "get_form_params", return_value=args), \
+        with patch.object(frappe, "__version__", "16.27.1"), \
+                patch.object(rb.reportview, "get_form_params", return_value=args), \
                 patch.object(rb.reportview, "is_virtual_doctype", return_value=True), \
                 patch.object(rb.reportview, "get_controller", return_value=controller), \
                 patch.object(frappe, "call", return_value=rows) as call, \
@@ -206,6 +236,37 @@ class PrintTests(unittest.TestCase):
         call.assert_called_once_with(controller.get_list, args=args, **args)
         execute.assert_not_called()
         self.assertEqual(result, {"keys": ["item", "rate"], "values": [["A", None]], "user_info": {}})
+
+    def test_v15_virtual_doctype_calls_controller_positionally(self):
+        args = frappe._dict(doctype="Purchase Invoice", fields=["item", "rate"], add_total_row=1)
+        rows = [frappe._dict(item="A", rate=1234)]
+        seen = []
+        def get_list(arg, /):
+            seen.append(arg)
+            return rows
+        with patch.object(frappe, "__version__", "15.126.1"), \
+                patch.object(rb.reportview, "get_form_params", return_value=args), \
+                patch.object(rb.reportview, "is_virtual_doctype", return_value=True), \
+                patch.object(rb.reportview, "get_controller", return_value=SimpleNamespace(get_list=get_list)), \
+                patch.object(frappe, "call") as call:
+            result = rb.get()
+        self.assertEqual(seen, [args])
+        call.assert_not_called()
+        self.assertEqual(result, {"keys": ["item", "rate"], "values": [["A", None]], "user_info": {}})
+
+    def test_virtual_controller_errors_are_not_retried(self):
+        args = frappe._dict(doctype="Purchase Invoice", fields=["item"])
+        for version in ("15.126.1", "16.27.1"):
+            def get_list(*args, **kwargs):
+                raise TypeError("controller failed")
+            with self.subTest(version=version), patch.object(frappe, "__version__", version), \
+                    patch.object(rb.reportview, "get_form_params", return_value=args), \
+                    patch.object(rb.reportview, "is_virtual_doctype", return_value=True), \
+                    patch.object(rb.reportview, "get_controller", return_value=SimpleNamespace(get_list=get_list)), \
+                    patch.object(frappe, "call", side_effect=lambda fn, **kwargs: fn(**kwargs)) as call:
+                with self.assertRaisesRegex(TypeError, "controller failed"):
+                    rb.get()
+                self.assertEqual(call.call_count, 0 if version.startswith("15") else 1)
 
     def test_validation_and_permission_exceptions_propagate(self):
         with patch.object(rb.reportview, "get_form_params", side_effect=ValueError("invalid")), \
@@ -293,6 +354,85 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual([str(x or "") for x in rows[3]], ["3", "Total", "5", ""])
                 self.assertNotIn("1234", str(rows))
                 self.assertNotIn("3234", str(rows))
+
+    def test_v15_csv_and_excel_without_style_api(self):
+        from frappe.utils import xlsxutils
+
+        calls = []
+        def legacy_make_xlsx(data, sheet_name, wb=None, column_widths=None):
+            calls.append(deepcopy(data))
+            return xlsxutils.make_xlsx(data, sheet_name)
+        legacy = SimpleNamespace(handle_html=xlsxutils.handle_html, make_xlsx=legacy_make_xlsx)
+        v15_info = [
+            {"name": "item", "label": "Item", "fieldtype": "Data", "translatable": False},
+            {"name": "rate", "label": "Rate", "fieldtype": "Data", "translatable": False},
+            {"name": "qty", "label": "Quantity", "fieldtype": "Data", "translatable": False},
+            {"name": "owner", "label": "owner", "fieldtype": "Data", "translatable": False},
+        ]
+        self.query([("A", 1234, 2, "alice")])
+        with patch.object(frappe.utils, "xlsxutils", legacy), \
+                patch.object(rb.reportview, "get_field_info", return_value=v15_info):
+            for fmt in ("CSV", "Excel"):
+                with self.subTest(fmt=fmt):
+                    _, extension, content = rb._export_query(params(file_format_type=fmt), CSV.copy(), False)
+                    rows = (list(csv.reader(io.StringIO(content.decode()))) if extension == "csv" else
+                            list(load_workbook(io.BytesIO(content), data_only=True).active.values))
+                    self.assertEqual(list(rows[0]), ["Sr", "Item", "Quantity", "owner"])
+                    self.assertEqual([str(value) for value in rows[1]], ["1", "A", "2", "alice"])
+                    self.assertNotIn("1234", str(rows))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], ["Sr", "Item", "Quantity", "owner"])
+
+    def test_v16_excel_styles_use_filtered_columns_and_rows(self):
+        from frappe.utils import xlsxutils
+
+        self.query([("A", 1234, 2, "alice")])
+        with patch.object(xlsxutils, "get_default_xlsx_styles", wraps=xlsxutils.get_default_xlsx_styles) as styles, \
+                patch.object(xlsxutils, "make_xlsx", wraps=xlsxutils.make_xlsx) as make:
+            rb._export_query(params(file_format_type="Excel", add_totals_row="1"), CSV.copy(), False)
+        self.assertEqual([column["label"] for column in styles.call_args.kwargs["columns"]],
+                         ["Sr", "Item", "Quantity", "owner"])
+        self.assertNotIn("1234", str(styles.call_args.kwargs["data"]))
+        self.assertTrue(styles.call_args.kwargs["has_total_row"])
+        self.assertIn("styles", make.call_args.kwargs)
+
+    def test_unknown_export_expressions_are_omitted(self):
+        info = {"fieldname": "qty", "label": "Quantity"}
+        for field in ("mystery(qty)", "qty + rate", "*", "sum(*)", "'x' || rate || 'y'",
+                      {"MYSTERY": ["qty"], "as": "safe"},
+                      {"SUM": {"MYSTERY": ["qty"]}, "as": "safe"}):
+            with self.subTest(field=field):
+                self.assertTrue(rb._sensitive(field, info, "Purchase Invoice", "Report", []))
+        self.assertFalse(rb._sensitive("sum(qty)", info, "Purchase Invoice", "Report", []))
+        self.assertTrue(rb._sensitive("sum(rate)", info, "Purchase Invoice", "Report", []))
+
+    def test_unknown_export_columns_are_removed_from_csv(self):
+        fields = ["item", "mystery(qty) as safe", {"SUM": {"MYSTERY": ["qty"]}, "as": "nested"}]
+        self.query([("A", 1234, 5678, "alice")])
+        _, _, content = rb._export_query(params(fields=fields), CSV.copy(), False)
+        self.assertEqual(list(csv.reader(io.StringIO(content.decode()))),
+                         [["Sr", "Item", "owner"], ["1", "A", "alice"]])
+
+    def test_unrestricted_v15_delegates_without_compatibility_apis(self):
+        from frappe.database import query
+
+        p = params()
+        payload = object()
+        with patch.object(frappe, "__version__", "15.126.1"), \
+                patch.object(rb, "get_policy", return_value=OPEN), \
+                patch.object(frappe.utils, "xlsxutils", SimpleNamespace()), \
+                patch.dict(query.__dict__), \
+                patch.object(rb.reportview, "get", return_value=payload) as get, \
+                patch.object(rb.reportview, "export_query", return_value=payload) as export, \
+                patch.object(rb.reportview, "_export_query", return_value=payload) as internal:
+            query.__dict__.pop("FUNCTION_MAPPING", None)
+            query.__dict__.pop("OPERATOR_MAPPING", None)
+            self.assertIs(rb.get(), payload)
+            self.assertIs(rb.export_query(), payload)
+            self.assertIs(rb._export_query(p, CSV, False), payload)
+        get.assert_called_once_with()
+        export.assert_called_once_with()
+        internal.assert_called_once_with(p, CSV, populate_response=False)
 
     def test_child_alias_label_and_aggregate_operand(self):
         fields = ["`tabPurchase Invoice Item`.`rate` as 'Purchase Invoice Item:rate'",
