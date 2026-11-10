@@ -1,0 +1,42 @@
+{
+ "doctype": "DocType",
+ "name": "Cost Visibility Settings",
+ "module": "Cost Visibility",
+ "creation": "2026-11-10 00:00:00.000000",
+ "modified": "2026-11-10 00:00:00.000000",
+ "modified_by": "Administrator",
+ "owner": "Administrator",
+ "issingle": 1,
+ "engine": "InnoDB",
+ "field_order": ["enabled", "restricted_users", "extra_patterns"],
+ "fields": [
+  {
+    "fieldname": "enabled",
+    "fieldtype": "Check",
+    "label": "Enabled",
+    "description": "Filters recognised cost fields in Desk, supported report exports and standard print bodies. APIs, custom templates, letterheads and other paths may still expose costs; this is not a security control.",
+    "default": "1"
+  },
+  {
+   "fieldname": "restricted_users",
+   "fieldtype": "Table",
+   "label": "Restricted Users",
+   "options": "Restricted Cost Visibility User"
+  },
+  {
+   "fieldname": "extra_patterns",
+   "fieldtype": "Table",
+   "label": "Additional Cost Phrases",
+   "description": "Literal case-insensitive substrings, not regular expressions.",
+   "options": "Cost Visibility Pattern"
+  }
+ ],
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1
+  }
+ ]
+}
